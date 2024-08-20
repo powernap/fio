@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 #include "../fio.h"
 #include "../optgroup.h"
@@ -78,7 +77,7 @@ struct fileaccess_options {
 
 enum {
 	FIO_FILEACCESS_ACCESS		= 1,
-	FIO_FILEACCESS_FACCESSAT2	= 2,
+	FIO_FILEACCESS_FACCESSAT	= 2,
 };
 
 static struct fio_option accoptions[] = {
@@ -94,8 +93,8 @@ static struct fio_option accoptions[] = {
 			    .oval = FIO_FILEACCESS_ACCESS,
 			    .help = "Use access(2)",
 			  },
-			  { .ival = "faccessat2",
-			    .oval = FIO_FILEACCESS_FACCESSAT2,
+			  { .ival = "faccessat",
+			    .oval = FIO_FILEACCESS_FACCESSAT,
 			    .help = "Use faccessat(2)",
 			  },
 		},
@@ -118,7 +117,7 @@ static struct fio_option accoptions[] = {
 		.type	= FIO_OPT_BOOL,
 		.off1	= offsetof(struct fileaccess_options, check_read),
 		.help	= "Check read access (add R_OK flag to access(2))",
-		.def	= "1",
+		.def	= "0",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_FILEACCESS,
 	},
@@ -297,13 +296,17 @@ static int access_file(struct thread_data *td, struct fio_file *f)
 	}
 
 	/* build access flags */
-	access_mode = 0;
-	if (o->check_write)
-		access_mode = access_mode | W_OK;
-	if (o->check_read)
-		access_mode = access_mode | R_OK;
-	if (o->check_exec)
-		access_mode = access_mode | X_OK;
+	if (!(o->check_write || o->check_read || o->check_exec)) {
+		access_mode = F_OK; /* if no checks specified, use F_OK */
+	} else {
+		access_mode = 0;
+		if (o->check_write)
+			access_mode = access_mode | W_OK;
+		if (o->check_read)
+			access_mode = access_mode | R_OK;
+		if (o->check_exec)
+			access_mode = access_mode | X_OK;
+	}
 
 	if (do_lat)
 		fio_gettime(&start, NULL);
@@ -312,8 +315,8 @@ static int access_file(struct thread_data *td, struct fio_file *f)
 	case FIO_FILEACCESS_ACCESS:
 		ret = access(f->file_name, access_mode);
 		break;
-	case FIO_FILEACCESS_FACCESSAT2:
-		ret = syscall(SYS_faccessat2, AT_FDCWD, f->file_name, access_mode, 0);
+	case FIO_FILEACCESS_FACCESSAT:
+		ret = faccessat(AT_FDCWD, f->file_name, access_mode, 0);
 		break;
 	default:
 		ret = -1;
