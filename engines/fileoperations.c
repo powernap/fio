@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include "../fio.h"
 #include "../optgroup.h"
@@ -61,6 +62,75 @@ static struct fio_option options[] = {
 		},
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_FILESTAT,
+	},
+	{
+		.name	= NULL,
+	},
+};
+
+struct fileaccess_options {
+	void *pad;
+	unsigned int access_type;
+	unsigned int check_write;
+	unsigned int check_read;
+	unsigned int check_exec;
+};
+
+enum {
+	FIO_FILEACCESS_ACCESS		= 1,
+	FIO_FILEACCESS_FACCESSAT2	= 2,
+};
+
+static struct fio_option accoptions[] = {
+	{
+		.name	= "access_type",
+		.lname	= "access_type",
+		.type	= FIO_OPT_STR,
+		.off1	= offsetof(struct fileaccess_options, access_type),
+		.help	= "Specify access system call type to measure access performance",
+		.def	= "access",
+		.posval = {
+			  { .ival = "access",
+			    .oval = FIO_FILEACCESS_ACCESS,
+			    .help = "Use access(2)",
+			  },
+			  { .ival = "faccessat2",
+			    .oval = FIO_FILEACCESS_FACCESSAT2,
+			    .help = "Use faccessat(2)",
+			  },
+		},
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_FILEACCESS,
+	},
+	{
+		.name	= "check_write_acc",
+		.lname	= "check_write_acc",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct fileaccess_options, check_write),
+		.help	= "Check write access (add W_OK flag to access(2))",
+		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_FILEACCESS,
+	},
+	{
+		.name	= "check_read_acc",
+		.lname	= "check_read_acc",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct fileaccess_options, check_read),
+		.help	= "Check read access (add R_OK flag to access(2))",
+		.def	= "1",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_FILEACCESS,
+	},
+	{
+		.name	= "check_exec_acc",
+		.lname	= "check_exec_acc",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct fileaccess_options, check_exec),
+		.help	= "Check exec access (add X_OK flag to access(2))",
+		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_FILEACCESS,
 	},
 	{
 		.name	= NULL,
@@ -191,6 +261,71 @@ static int stat_file(struct thread_data *td, struct fio_file *f)
 
 		snprintf(buf, sizeof(buf), "stat(%s) type=%u", f->file_name,
 			o->stat_type);
+		td_verror(td, e, buf);
+		return 1;
+	}
+
+	if (do_lat) {
+		struct fc_data *data = td->io_ops_data;
+		uint64_t nsec;
+
+		nsec = ntime_since_now(&start);
+		add_clat_sample(td, data->stat_ddir, nsec, 0, 0, 0, 0);
+	}
+
+	return 0;
+}
+
+static int access_file(struct thread_data *td, struct fio_file *f)
+{
+	struct fileaccess_options *o = td->eo;
+	struct timespec start;
+	int do_lat = !td->o.disable_lat;
+	int ret, access_mode;
+
+	dprint(FD_FILE, "fd access %s\n", f->file_name);
+
+	/*
+	if (f->filetype != FIO_TYPE_FILE) {
+		log_err("fio: only files are supported\n");
+		return 1;
+	}
+	*/
+	if (!strcmp(f->file_name, "-")) {
+		log_err("fio: can't read/write to stdin/out\n");
+		return 1;
+	}
+
+	/* build access flags */
+	access_mode = 0;
+	if (o->check_write)
+		access_mode = access_mode | W_OK;
+	if (o->check_read)
+		access_mode = access_mode | R_OK;
+	if (o->check_exec)
+		access_mode = access_mode | X_OK;
+
+	if (do_lat)
+		fio_gettime(&start, NULL);
+
+	switch (o->access_type) {
+	case FIO_FILEACCESS_ACCESS:
+		ret = access(f->file_name, access_mode);
+		break;
+	case FIO_FILEACCESS_FACCESSAT2:
+		ret = syscall(SYS_faccessat2, AT_FDCWD, f->file_name, access_mode, 0);
+		break;
+	default:
+		ret = -1;
+		break;
+	}
+
+	if (ret == -1) {
+		char buf[FIO_VERROR_SIZE];
+		int e = errno;
+
+		snprintf(buf, sizeof(buf), "access(%s) type=%u", f->file_name,
+			o->access_type);
 		td_verror(td, e, buf);
 		return 1;
 	}
@@ -345,6 +480,21 @@ static struct ioengine_ops ioengine_filestat = {
 	.option_struct_size = sizeof(struct filestat_options),
 };
 
+static struct ioengine_ops ioengine_fileaccess = {
+	.name		= "fileaccess",
+	.version	= FIO_IOOPS_VERSION,
+	.init		= init,
+	.cleanup	= cleanup,
+	.queue		= queue_io,
+	.invalidate	= invalidate_do_nothing,
+	.get_file_size	= generic_get_file_size,
+	.open_file	= access_file,
+	.flags		=  FIO_SYNCIO | FIO_FAKEIO |
+				FIO_NOSTATS | FIO_NOFILEHASH,
+	.options	= accoptions,
+	.option_struct_size = sizeof(struct fileaccess_options),
+};
+
 static struct ioengine_ops ioengine_filedelete = {
 	.name		= "filedelete",
 	.version	= FIO_IOOPS_VERSION,
@@ -389,6 +539,23 @@ static struct ioengine_ops ioengine_dirstat = {
 	.option_struct_size = sizeof(struct filestat_options),
 };
 
+static struct ioengine_ops ioengine_diraccess = {
+	.name		= "diraccess",
+	.version	= FIO_IOOPS_VERSION,
+	.setup		= setup_dirs,
+	.init		= init,
+	.cleanup	= cleanup,
+	.queue		= queue_io,
+	.invalidate	= invalidate_do_nothing,
+	.get_file_size	= generic_get_file_size,
+	.open_file	= access_file,
+	.unlink_file	= remove_dir,
+	.flags		=  FIO_DISKLESSIO | FIO_SYNCIO | FIO_FAKEIO |
+				FIO_NOSTATS | FIO_NOFILEHASH,
+	.options	= accoptions,
+	.option_struct_size = sizeof(struct fileaccess_options),
+};
+
 static struct ioengine_ops ioengine_dirdelete = {
 	.name		= "dirdelete",
 	.version	= FIO_IOOPS_VERSION,
@@ -408,9 +575,11 @@ static void fio_init fio_fileoperations_register(void)
 {
 	register_ioengine(&ioengine_filecreate);
 	register_ioengine(&ioengine_filestat);
+	register_ioengine(&ioengine_fileaccess);
 	register_ioengine(&ioengine_filedelete);
 	register_ioengine(&ioengine_dircreate);
 	register_ioengine(&ioengine_dirstat);
+	register_ioengine(&ioengine_diraccess);
 	register_ioengine(&ioengine_dirdelete);
 }
 
@@ -418,8 +587,10 @@ static void fio_exit fio_fileoperations_unregister(void)
 {
 	unregister_ioengine(&ioengine_filecreate);
 	unregister_ioengine(&ioengine_filestat);
+	unregister_ioengine(&ioengine_fileaccess);
 	unregister_ioengine(&ioengine_filedelete);
 	unregister_ioengine(&ioengine_dircreate);
 	unregister_ioengine(&ioengine_dirstat);
+	unregister_ioengine(&ioengine_diraccess);
 	unregister_ioengine(&ioengine_dirdelete);
 }
