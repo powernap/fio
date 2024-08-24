@@ -77,7 +77,9 @@ struct fileaccess_options {
 
 enum {
 	FIO_FILEACCESS_ACCESS		= 1,
+#ifndef WIN32
 	FIO_FILEACCESS_FACCESSAT	= 2,
+#endif
 };
 
 static struct fio_option accoptions[] = {
@@ -93,10 +95,12 @@ static struct fio_option accoptions[] = {
 			    .oval = FIO_FILEACCESS_ACCESS,
 			    .help = "Use access(2)",
 			  },
+#ifndef WIN32
 			  { .ival = "faccessat",
 			    .oval = FIO_FILEACCESS_FACCESSAT,
 			    .help = "Use faccessat(2)",
 			  },
+#endif
 		},
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_FILEACCESS,
@@ -315,9 +319,11 @@ static int access_file(struct thread_data *td, struct fio_file *f)
 	case FIO_FILEACCESS_ACCESS:
 		ret = access(f->file_name, access_mode);
 		break;
+#ifndef WIN32
 	case FIO_FILEACCESS_FACCESSAT:
 		ret = faccessat(AT_FDCWD, f->file_name, access_mode, 0);
 		break;
+#endif
 	default:
 		ret = -1;
 		break;
