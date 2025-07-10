@@ -612,7 +612,14 @@ static int fixup_options(struct thread_data *td)
 	struct thread_options *o = &td->o;
 	int ret = 0;
 
-	if (read_only && (td_write(td) || td_trim(td))) {
+	/*
+	 * Denote whether we are verifying trims. Now we only have to check a
+	 * single variable instead of having to check all three options.
+	 */
+	td->trim_verify = o->verify && o->trim_backlog && o->trim_percentage;
+	dprint(FD_VERIFY, "td->trim_verify=%d\n", td->trim_verify);
+
+	if (read_only && (td_write(td) || td_trim(td) || td->trim_verify)) {
 		log_err("fio: trim and write operations are not allowed"
 			 " with the --readonly parameter.\n");
 		ret |= 1;
@@ -853,6 +860,59 @@ static int fixup_options(struct thread_data *td)
 		    (o->max_bs[DDIR_WRITE] % o->verify_interval))
 			o->verify_interval = gcd(o->min_bs[DDIR_WRITE],
 							o->max_bs[DDIR_WRITE]);
+
+		if (o->verify_only) {
+			if (!fio_option_is_set(o, verify_write_sequence))
+				o->verify_write_sequence = 0;
+
+			if (!fio_option_is_set(o, verify_header_seed))
+				o->verify_header_seed = 0;
+		}
+
+		if (o->norandommap && !td_ioengine_flagged(td, FIO_SYNCIO) &&
+		    o->iodepth > 1) {
+			/*
+			 * Disable write sequence checks with norandommap and
+			 * iodepth > 1.
+			 * Unless we were explicitly asked to enable it.
+			 */
+			if (!fio_option_is_set(o, verify_write_sequence))
+				o->verify_write_sequence = 0;
+		}
+
+		/*
+		 * Verify header should not be offset beyond the verify
+		 * interval.
+		 */
+		if (o->verify_offset + sizeof(struct verify_header) >
+		    o->verify_interval) {
+			log_err("fio: cannot offset verify header beyond the "
+				"verify interval.\n");
+			ret |= 1;
+		}
+
+		/*
+		 * Disable rand_seed check when we have verify_backlog,
+		 * zone reset frequency for zonemode=zbd, or if we are using
+		 * an RB tree for IO history logs.
+		 * Unless we were explicitly asked to enable it.
+		 */
+		if (!td_write(td) || (td->flags & TD_F_VER_BACKLOG) ||
+		    o->zrf.u.f || fio_offset_overlap_risk(td)) {
+			if (!fio_option_is_set(o, verify_header_seed))
+				o->verify_header_seed = 0;
+		}
+	}
+
+	if (td->o.oatomic) {
+		if (!td_ioengine_flagged(td, FIO_ATOMICWRITES)) {
+			log_err("fio: engine does not support atomic writes\n");
+			td->o.oatomic = 0;
+			ret |= 1;
+		}
+
+		if (!td_write(td))
+			td->o.oatomic = 0;
 	}
 
 	if (o->pre_read) {
@@ -1621,11 +1681,17 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.log_type = IO_LOG_TYPE_LAT,
 			.log_offset = o->log_offset,
 			.log_prio = o->log_prio,
+			.log_issue_time = o->log_issue_time,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};
 		const char *pre = make_log_name(o->lat_log_file, o->name);
 		const char *suf;
+
+		if (o->log_issue_time && !o->log_offset) {
+			log_err("fio: log_issue_time option requires write_lat_log and log_offset options\n");
+			goto err;
+		}
 
 		if (p.log_gz_store)
 			suf = "log.fz";
@@ -1650,6 +1716,9 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			setup_log(&td->clat_log, &p, logname);
 		}
 
+	} else if (o->log_issue_time) {
+		log_err("fio: log_issue_time option requires write_lat_log and log_offset options\n");
+		goto err;
 	}
 
 	if (o->write_hist_log) {
@@ -1661,6 +1730,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.log_type = IO_LOG_TYPE_HIST,
 			.log_offset = o->log_offset,
 			.log_prio = o->log_prio,
+			.log_issue_time = o->log_issue_time,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};
@@ -1693,6 +1763,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.log_type = IO_LOG_TYPE_BW,
 			.log_offset = o->log_offset,
 			.log_prio = o->log_prio,
+			.log_issue_time = o->log_issue_time,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};
@@ -1725,6 +1796,7 @@ static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 			.log_type = IO_LOG_TYPE_IOPS,
 			.log_offset = o->log_offset,
 			.log_prio = o->log_prio,
+			.log_issue_time = o->log_issue_time,
 			.log_gz = o->log_gz,
 			.log_gz_store = o->log_gz_store,
 		};

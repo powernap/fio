@@ -146,6 +146,7 @@ struct thread_options {
 	unsigned int verify_offset;
 	char *verify_pattern;
 	unsigned int verify_pattern_bytes;
+	unsigned int verify_pattern_interval;
 	struct pattern_fmt verify_fmt[8];
 	unsigned int verify_fmt_sz;
 	unsigned int verify_fatal;
@@ -156,6 +157,8 @@ struct thread_options {
 	unsigned int experimental_verify;
 	unsigned int verify_state;
 	unsigned int verify_state_save;
+	unsigned int verify_write_sequence;
+	unsigned int verify_header_seed;
 	unsigned int use_thread;
 	unsigned int unlink;
 	unsigned int unlink_each_loop;
@@ -388,6 +391,7 @@ struct thread_options {
 	int max_open_zones;
 	unsigned int job_max_open_zones;
 	unsigned int ignore_zone_limits;
+	unsigned int recover_zbd_write_error;
 	fio_fp64_t zrt;
 	fio_fp64_t zrf;
 
@@ -400,6 +404,7 @@ struct thread_options {
 
 	unsigned int log_entries;
 	unsigned int log_prio;
+	unsigned int log_issue_time;
 };
 
 #define FIO_TOP_STR_MAX		256
@@ -474,6 +479,7 @@ struct thread_options_pack {
 	uint32_t verify_interval;
 	uint32_t verify_offset;
 	uint32_t verify_pattern_bytes;
+	uint32_t verify_pattern_interval;
 	uint32_t verify_fatal;
 	uint32_t verify_dump;
 	uint32_t verify_async;
@@ -482,6 +488,8 @@ struct thread_options_pack {
 	uint32_t experimental_verify;
 	uint32_t verify_state;
 	uint32_t verify_state_save;
+	uint32_t verify_write_sequence;
+	uint32_t verify_header_seed;
 	uint32_t use_thread;
 	uint32_t unlink;
 	uint32_t unlink_each_loop;
@@ -511,6 +519,7 @@ struct thread_options_pack {
 
 	struct zone_split zone_split[DDIR_RWDIR_CNT][ZONESPLIT_MAX];
 	uint32_t zone_split_nr[DDIR_RWDIR_CNT];
+	uint32_t pad2;
 
 	fio_fp64_t zipf_theta;
 	fio_fp64_t pareto_h;
@@ -705,9 +714,11 @@ struct thread_options_pack {
 	uint32_t zone_mode;
 	int32_t max_open_zones;
 	uint32_t ignore_zone_limits;
+	uint32_t recover_zbd_write_error;
 
 	uint32_t log_entries;
 	uint32_t log_prio;
+	uint32_t log_issue_time;
 
 	uint32_t fdp;
 	uint32_t dp_type;

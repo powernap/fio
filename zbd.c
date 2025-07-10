@@ -443,6 +443,46 @@ static int zbd_reset_zones(struct thread_data *td, struct fio_file *f,
 }
 
 /**
+ * zbd_move_zone_wp - move the write pointer of a zone by writing the data in
+ *               the specified buffer
+ * @td: FIO thread data.
+ * @f: FIO file for which to move write pointer
+ * @z: Target zone to move the write pointer
+ * @length: Length of the move
+ * @buf: Buffer which holds the data to write
+ *
+ * Move the write pointer at the specified offset by writing the data
+ * in the specified buffer.
+ * Returns 0 upon success and a negative error code upon failure.
+ */
+static int zbd_move_zone_wp(struct thread_data *td, struct fio_file *f,
+			    struct zbd_zone *z, uint64_t length,
+			    const char *buf)
+{
+	int ret = 0;
+
+	switch (f->zbd_info->model) {
+	case ZBD_HOST_AWARE:
+	case ZBD_HOST_MANAGED:
+		if (td->io_ops && td->io_ops->move_zone_wp)
+			ret = td->io_ops->move_zone_wp(td, f, z, length, buf);
+		else
+			ret = blkzoned_move_zone_wp(td, f, z, length, buf);
+		break;
+	default:
+		break;
+	}
+
+	if (ret < 0) {
+		td_verror(td, errno, "move wp failed");
+		log_err("%s: moving wp for %"PRIu64" sectors at sector %"PRIu64" failed (%d).\n",
+			f->file_name, length >> 9, z->wp >> 9, errno);
+	}
+
+	return ret;
+}
+
+/**
  * zbd_get_max_open_zones - Get the maximum number of open zones
  * @td: FIO thread data
  * @f: FIO file for which to get max open zones
@@ -1227,6 +1267,18 @@ int zbd_setup_files(struct thread_data *td)
 	if (!zbd_verify_bs())
 		return 1;
 
+	if (td->o.recover_zbd_write_error && td_write(td)) {
+		if (!td->o.continue_on_error) {
+			log_err("recover_zbd_write_error works only when continue_on_error is set\n");
+			return 1;
+		}
+		if (td->o.verify != VERIFY_NONE &&
+		    !td_ioengine_flagged(td, FIO_SYNCIO)) {
+			log_err("recover_zbd_write_error for async IO engines does not support verify\n");
+			return 1;
+		}
+	}
+
 	if (td->o.experimental_verify) {
 		log_err("zonemode=zbd does not support experimental verify\n");
 		return 1;
@@ -1262,6 +1314,16 @@ int zbd_setup_files(struct thread_data *td)
 		    zbd->max_write_zones != td->o.max_open_zones) {
 			log_err("Different 'max_open_zones' values\n");
 			return 1;
+		}
+
+		/*
+		 * If this job does not do write operations, skip open zone
+		 * condition check.
+		 */
+		if (!td_write(td)) {
+			if (td->o.job_max_open_zones)
+				log_info("'job_max_open_zones' is valid only for write jobs\n");
+			continue;
 		}
 
 		/*
@@ -1376,6 +1438,43 @@ static uint32_t pick_random_zone_idx(const struct fio_file *f,
 		f->zbd_info->num_write_zones / f->io_size;
 }
 
+/*
+ * Randomly choose a zone in the array of write zones and in the range for the
+ * file f. If such a zone is found, return its index in f->zbd_info->zone_info[]
+ * using @zone_idx, and return true. Otherwise, return false.
+ *
+ * Caller must hold f->zbd_info->mutex.
+ */
+static bool zbd_pick_write_zone(const struct fio_file* f,
+				const struct io_u *io_u, uint32_t *zone_idx)
+{
+	struct zoned_block_device_info *zbdi = f->zbd_info;
+	uint32_t write_zone_idx;
+	uint32_t cur_zone_idx;
+	int i;
+
+	/*
+	 * An array of write target zones is per-device, shared across all jobs.
+	 * Start with quasi-random candidate zone. Ignore zones which do not
+	 * belong to offset/size range of the current job.
+	 */
+	write_zone_idx = pick_random_zone_idx(f, io_u);
+	assert(!write_zone_idx || write_zone_idx < zbdi->num_write_zones);
+
+	for (i = 0; i < zbdi->num_write_zones; i++) {
+		if (write_zone_idx >= zbdi->num_write_zones)
+			write_zone_idx = 0;
+		cur_zone_idx = zbdi->write_zones[write_zone_idx];
+		if (f->min_zone <= cur_zone_idx && cur_zone_idx < f->max_zone) {
+			*zone_idx = cur_zone_idx;
+			return true;
+		}
+		write_zone_idx++;
+	}
+
+	return false;
+}
+
 static bool any_io_in_flight(void)
 {
 	for_each_td(td) {
@@ -1386,29 +1485,64 @@ static bool any_io_in_flight(void)
 	return false;
 }
 
-/*
+/**
+ * zbd_convert_to_write_zone - Convert the target zone of an io_u to a writable zone
+ * @td: The fio thread data
+ * @io_u: The I/O unit that targets the zone to convert
+ * @zb: The zone selected at the beginning of the function call. The caller must
+ *      hold zb->mutex.
+ *
  * Modify the offset of an I/O unit that does not refer to a zone such that
- * in write target zones array. Add a zone to or remove a zone from the lsit if
+ * in write target zones array. Add a zone to or remove a zone from the array if
  * necessary. The write target zone is searched across sequential zones.
  * This algorithm can only work correctly if all write pointers are
- * a multiple of the fio block size. The caller must neither hold z->mutex
- * nor f->zbd_info->mutex. Returns with z->mutex held upon success.
+ * a multiple of the fio block size. The caller must not hold
+ * f->zbd_info->mutex. Returns with z->mutex held upon success.
  */
 static struct fio_zone_info *zbd_convert_to_write_zone(struct thread_data *td,
-						       struct io_u *io_u)
+						       struct io_u *io_u,
+						       struct fio_zone_info *zb)
 {
 	const uint64_t min_bs = td->o.min_bs[io_u->ddir];
 	struct fio_file *f = io_u->file;
 	struct zoned_block_device_info *zbdi = f->zbd_info;
 	struct fio_zone_info *z;
-	unsigned int write_zone_idx = -1;
 	uint32_t zone_idx, new_zone_idx;
 	int i;
 	bool wait_zone_write;
 	bool in_flight;
 	bool should_retry = true;
+	bool need_zone_finish;
 
 	assert(is_valid_offset(f, io_u->offset));
+
+	if (zbd_zone_remainder(zb) > 0 && zbd_zone_remainder(zb) < min_bs) {
+		pthread_mutex_lock(&f->zbd_info->mutex);
+		zbd_write_zone_put(td, f, zb);
+		pthread_mutex_unlock(&f->zbd_info->mutex);
+		dprint(FD_ZBD, "%s: finish zone %d\n",
+		       f->file_name, zbd_zone_idx(f, zb));
+		io_u_quiesce(td);
+		zbd_finish_zone(td, f, zb);
+		zone_unlock(zb);
+
+		if (zbd_zone_idx(f, zb) + 1 >= f->max_zone && !td_random(td))
+			return NULL;
+
+		/* Find the next write pointer zone */
+		do {
+			zb++;
+			if (zbd_zone_idx(f, zb) >= f->max_zone)
+				zb = zbd_get_zone(f, f->min_zone);
+		} while (!zb->has_wp);
+
+		zone_lock(td, f, zb);
+	}
+
+	if (zbd_write_zone_get(td, f, zb))
+		return zb;
+
+	zone_unlock(zb);
 
 	if (zbdi->max_write_zones || td->o.job_max_open_zones) {
 		/*
@@ -1435,8 +1569,6 @@ static struct fio_zone_info *zbd_convert_to_write_zone(struct thread_data *td,
 	 * has been obtained. Hence the loop.
 	 */
 	for (;;) {
-		uint32_t tmp_idx;
-
 		z = zbd_get_zone(f, zone_idx);
 		if (z->has_wp)
 			zone_lock(td, f, z);
@@ -1455,42 +1587,15 @@ static struct fio_zone_info *zbd_convert_to_write_zone(struct thread_data *td,
 			}
 		}
 
-		/*
-		 * Array of write target zones is per-device, shared across all
-		 * threads. Start with quasi-random candidate zone. Ignore
-		 * zones which don't belong to thread's offset/size area.
-		 */
-		write_zone_idx = pick_random_zone_idx(f, io_u);
-		assert(!write_zone_idx ||
-		       write_zone_idx < zbdi->num_write_zones);
-		tmp_idx = write_zone_idx;
-
-		for (i = 0; i < zbdi->num_write_zones; i++) {
-			uint32_t tmpz;
-
-			if (tmp_idx >= zbdi->num_write_zones)
-				tmp_idx = 0;
-			tmpz = zbdi->write_zones[tmp_idx];
-			if (f->min_zone <= tmpz && tmpz < f->max_zone) {
-				write_zone_idx = tmp_idx;
-				goto found_candidate_zone;
-			}
-
-			tmp_idx++;
+		if (!zbd_pick_write_zone(f, io_u, &new_zone_idx)) {
+			dprint(FD_ZBD, "%s(%s): no candidate zone\n",
+			       __func__, f->file_name);
+			pthread_mutex_unlock(&zbdi->mutex);
+			if (z->has_wp)
+				zone_unlock(z);
+			return NULL;
 		}
 
-		dprint(FD_ZBD, "%s(%s): no candidate zone\n",
-			__func__, f->file_name);
-
-		pthread_mutex_unlock(&zbdi->mutex);
-
-		if (z->has_wp)
-			zone_unlock(z);
-
-		return NULL;
-
-found_candidate_zone:
-		new_zone_idx = zbdi->write_zones[write_zone_idx];
 		if (new_zone_idx == zone_idx)
 			break;
 		zone_idx = new_zone_idx;
@@ -1559,6 +1664,7 @@ retry:
 
 	/* Check whether the write fits in any of the write target zones. */
 	pthread_mutex_lock(&zbdi->mutex);
+	need_zone_finish = true;
 	for (i = 0; i < zbdi->num_write_zones; i++) {
 		zone_idx = zbdi->write_zones[i];
 		if (zone_idx < f->min_zone || zone_idx >= f->max_zone)
@@ -1569,8 +1675,10 @@ retry:
 		z = zbd_get_zone(f, zone_idx);
 
 		zone_lock(td, f, z);
-		if (zbd_zone_remainder(z) >= min_bs)
+		if (zbd_zone_remainder(z) >= min_bs) {
+			need_zone_finish = false;
 			goto out;
+		}
 		pthread_mutex_lock(&zbdi->mutex);
 	}
 
@@ -1592,6 +1700,26 @@ retry:
 		zone_lock(td, f, z);
 		goto retry;
 	}
+
+	if (td_random(td) && td->o.verify == VERIFY_NONE && need_zone_finish)
+		/*
+		 * If all open zones have remainder smaller than the block size
+		 * for random write jobs, choose one of the write target zones
+		 * and finish it. When verify is enabled, skip this zone finish
+		 * operation to avoid verify data corruption by overwrite to the
+		 * zone.
+		 */
+		if (zbd_pick_write_zone(f, io_u, &zone_idx)) {
+			pthread_mutex_unlock(&zbdi->mutex);
+			zone_unlock(z);
+			z = zbd_get_zone(f, zone_idx);
+			zone_lock(td, f, z);
+			io_u_quiesce(td);
+			dprint(FD_ZBD, "%s(%s): All write target zones have remainder smaller than block size. Choose zone %d and finish.\n",
+			       __func__, f->file_name, zone_idx);
+			zbd_finish_zone(td, f, z);
+			goto out;
+		}
 
 	pthread_mutex_unlock(&zbdi->mutex);
 
@@ -1694,11 +1822,11 @@ static void zbd_end_zone_io(struct thread_data *td, const struct io_u *io_u,
  * For write and trim operations, update the write pointer of the I/O unit
  * target zone.
  */
-static void zbd_queue_io(struct thread_data *td, struct io_u *io_u, int q,
-			 bool success)
+static void zbd_queue_io(struct thread_data *td, struct io_u *io_u, int *q)
 {
 	const struct fio_file *f = io_u->file;
 	struct zoned_block_device_info *zbd_info = f->zbd_info;
+	bool success = io_u->error == 0;
 	struct fio_zone_info *z;
 	uint64_t zone_end;
 
@@ -1706,6 +1834,14 @@ static void zbd_queue_io(struct thread_data *td, struct io_u *io_u, int q,
 
 	z = zbd_offset_to_zone(f, io_u->offset);
 	assert(z->has_wp);
+
+	if (!success && td->o.recover_zbd_write_error &&
+	    io_u->ddir == DDIR_WRITE && td_ioengine_flagged(td, FIO_SYNCIO) &&
+	    *q == FIO_Q_COMPLETED) {
+		zbd_recover_write_error(td, io_u);
+		if (!io_u->error)
+			success = true;
+	}
 
 	if (!success)
 		goto unlock;
@@ -1734,11 +1870,19 @@ static void zbd_queue_io(struct thread_data *td, struct io_u *io_u, int q,
 		break;
 	}
 
-	if (q == FIO_Q_COMPLETED && !io_u->error)
+	if (*q == FIO_Q_COMPLETED && !io_u->error)
 		zbd_end_zone_io(td, io_u, z);
 
 unlock:
-	if (!success || q != FIO_Q_QUEUED) {
+	if (!success || *q != FIO_Q_QUEUED) {
+		if (io_u->ddir == DDIR_WRITE) {
+			z->writes_in_flight--;
+			if (z->writes_in_flight == 0 && z->fixing_zone_wp) {
+				dprint(FD_ZBD, "%s: Fixed write pointer of the zone %u\n",
+				       f->file_name, zbd_zone_idx(f, z));
+				z->fixing_zone_wp = 0;
+			}
+		}
 		/* BUSY or COMPLETED: unlock the zone */
 		zone_unlock(z);
 		io_u->zbd_put_io = NULL;
@@ -1764,6 +1908,15 @@ static void zbd_put_io(struct thread_data *td, const struct io_u *io_u)
 	       f->file_name, io_u->offset, io_u->buflen, zbd_zone_idx(f, z));
 
 	zbd_end_zone_io(td, io_u, z);
+
+	if (io_u->ddir == DDIR_WRITE) {
+		z->writes_in_flight--;
+		if (z->writes_in_flight == 0 && z->fixing_zone_wp) {
+			z->fixing_zone_wp = 0;
+			dprint(FD_ZBD, "%s: Fixed write pointer of the zone %u\n",
+			       f->file_name, zbd_zone_idx(f, z));
+		}
+	}
 
 	zone_unlock(z);
 }
@@ -1955,7 +2108,14 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 	    io_u->ddir == DDIR_READ && td->o.read_beyond_wp)
 		return io_u_accept;
 
+retry_lock:
 	zone_lock(td, f, zb);
+
+	if (!td_ioengine_flagged(td, FIO_SYNCIO) && zb->fixing_zone_wp) {
+		zone_unlock(zb);
+		io_u_quiesce(td);
+		goto retry_lock;
+	}
 
 	switch (io_u->ddir) {
 	case DDIR_READ:
@@ -2037,40 +2197,11 @@ enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 		}
 
 retry:
-		if (zbd_zone_remainder(zb) > 0 &&
-		    zbd_zone_remainder(zb) < min_bs) {
-			pthread_mutex_lock(&f->zbd_info->mutex);
-			zbd_write_zone_put(td, f, zb);
-			pthread_mutex_unlock(&f->zbd_info->mutex);
-			dprint(FD_ZBD,
-			       "%s: finish zone %d\n",
-			       f->file_name, zbd_zone_idx(f, zb));
-			io_u_quiesce(td);
-			zbd_finish_zone(td, f, zb);
-			if (zbd_zone_idx(f, zb) + 1 >= f->max_zone) {
-				if (!td_random(td))
-					goto eof;
-			}
-			zone_unlock(zb);
-
-			/* Find the next write pointer zone */
-			do {
-				zb++;
-				if (zbd_zone_idx(f, zb) >= f->max_zone)
-					zb = zbd_get_zone(f, f->min_zone);
-			} while (!zb->has_wp);
-
-			zone_lock(td, f, zb);
-		}
-
-		if (!zbd_write_zone_get(td, f, zb)) {
-			zone_unlock(zb);
-			zb = zbd_convert_to_write_zone(td, io_u);
-			if (!zb) {
-				dprint(FD_IO, "%s: can't convert to write target zone",
-				       f->file_name);
-				goto eof;
-			}
+		zb = zbd_convert_to_write_zone(td, io_u, zb);
+		if (!zb) {
+			dprint(FD_IO, "%s: can't convert to write target zone",
+			       f->file_name);
+			goto eof;
 		}
 
 		if (zbd_zone_remainder(zb) > 0 &&
@@ -2192,6 +2323,8 @@ accept:
 
 	io_u->zbd_queue_io = zbd_queue_io;
 	io_u->zbd_put_io = zbd_put_io;
+	if (io_u->ddir == DDIR_WRITE)
+		zb->writes_in_flight++;
 
 	/*
 	 * Since we return with the zone lock still held,
@@ -2262,4 +2395,72 @@ void zbd_log_err(const struct thread_data *td, const struct io_u *io_u)
 	if (io_u->error == EOVERFLOW)
 		log_err("%s: Exceeded max_active_zones limit. Check conditions of zones out of I/O ranges.\n",
 			f->file_name);
+}
+
+void zbd_recover_write_error(struct thread_data *td, struct io_u *io_u)
+{
+	struct fio_file *f = io_u->file;
+	struct fio_zone_info *z;
+	struct zbd_zone zrep;
+	unsigned long long retry_offset;
+	unsigned long long retry_len;
+	char *retry_buf;
+	uint64_t write_end_offset;
+	int ret;
+
+	z = zbd_offset_to_zone(f, io_u->offset);
+	if (!z->has_wp)
+		return;
+	write_end_offset = io_u->offset + io_u->buflen - z->start;
+
+	assert(z->writes_in_flight);
+
+	if (!z->fixing_zone_wp) {
+		z->fixing_zone_wp = 1;
+		dprint(FD_ZBD, "%s: Start fixing %u write pointer\n",
+		       f->file_name, zbd_zone_idx(f, z));
+	}
+
+	if (z->max_write_error_offset < write_end_offset)
+		z->max_write_error_offset = write_end_offset;
+
+	if (z->writes_in_flight > 1)
+		return;
+
+	/*
+	 * This is the last write to the zone since the write error to recover.
+	 * Get the zone current write pointer and recover the write pointer
+	 * position so that next write can continue.
+	 */
+	ret = zbd_report_zones(td, f, z->start, &zrep, 1);
+	if (ret != 1) {
+		log_info("fio: Report zone for write recovery failed for %s\n",
+			 f->file_name);
+		return;
+	}
+
+	if (zrep.wp < z->start ||
+	    z->start + z->max_write_error_offset < zrep.wp ) {
+		log_info("fio: unexpected write pointer position on error for %s: wp=%"PRIu64"\n",
+			 f->file_name, zrep.wp);
+		return;
+	}
+
+	retry_offset = zrep.wp;
+	retry_len = z->start + z->max_write_error_offset - retry_offset;
+	retry_buf = NULL;
+	if (retry_offset >= io_u->offset)
+		retry_buf = (char *)io_u->buf + (retry_offset - io_u->offset);
+
+	ret = zbd_move_zone_wp(td, io_u->file, &zrep, retry_len, retry_buf);
+	if (ret) {
+		log_info("fio: Failed to recover write pointer for %s\n",
+			 f->file_name);
+		return;
+	}
+
+	z->wp = retry_offset + retry_len;
+
+	dprint(FD_ZBD, "%s: Write pointer move succeeded for error=%d\n",
+	       f->file_name, io_u->error);
 }

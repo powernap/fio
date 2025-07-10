@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # This script expects to be invoked from the base fio directory.
 set -eu
 
@@ -6,16 +6,18 @@ SCRIPT_DIR=$(dirname "$0")
 # shellcheck disable=SC1091
 . "${SCRIPT_DIR}/common.sh"
 
+_sudo() {
+    if type -P sudo >/dev/null; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
 install_ubuntu() {
     local pkgs
 
-    if [ "${GITHUB_JOB}" == "build-containers" ]; then
-        # containers run as root and do not have sudo
-        apt update
-        apt -y install sudo
-    fi
-
-    cat <<DPKGCFG | sudo tee /etc/dpkg/dpkg.cfg.d/dpkg-speedup > /dev/null
+    cat <<DPKGCFG | _sudo tee /etc/dpkg/dpkg.cfg.d/dpkg-speedup > /dev/null
 # Skip fsync
 force-unsafe-io
 # Don't install documentation
@@ -30,13 +32,14 @@ DPKGCFG
         libcunit1-dev
         libcurl4-openssl-dev
         libfl-dev
+	libgnutls28-dev
         libnuma-dev
 	libnfs-dev
         valgrind
     )
     case "${CI_TARGET_ARCH}" in
         "i686")
-            sudo dpkg --add-architecture i386
+            _sudo dpkg --add-architecture i386
             pkgs=("${pkgs[@]/%/:i386}")
             pkgs+=(
                 gcc-multilib
@@ -54,16 +57,16 @@ DPKGCFG
                 libiscsi-dev
                 libnbd-dev
                 libpmem-dev
-                libpmem2-dev
-                libprotobuf-c-dev
                 librbd-dev
                 libtcmalloc-minimal4
                 libibverbs-dev
                 librdmacm-dev
 	        pkg-config
             )
-	    echo "Removing libunwind-14-dev because of conflicts with libunwind-dev"
-	    sudo apt remove -y libunwind-14-dev
+	    if apt list --installed | grep -c "libunwind-14-dev"; then
+		    echo "Removing libunwind-14-dev because of conflicts with libunwind-dev"
+		    _sudo apt remove -y libunwind-14-dev
+	    fi
 	    if [ "${CI_TARGET_OS}" == "linux" ] || [ "${CI_TARGET_OS}" == "ubuntu" ]; then
 	        # Only for Ubuntu
 		pkgs+=(
@@ -79,57 +82,100 @@ DPKGCFG
         python3-scipy
 	python3-sphinx
 	python3-statsmodels
+	sudo
+	${EXTRA_PKGS:-}
     )
-    if [ "${GITHUB_JOB}" == "build-containers" ]; then
+    if [ "${GITHUB_JOB}" == "build-containers" ] || [ "${GITHUB_JOB}" == "qemu-guest" ]; then
         pkgs+=(
             bison
             build-essential
-            cmake
             flex
-            unzip
-            wget
+            procps
             zlib1g-dev
         )
     fi
 
     echo "Updating APT..."
-    sudo apt-get -qq update
+    _sudo apt-get -qq update
     echo "Installing packages... ${pkgs[@]}"
-    sudo apt-get install -o APT::Immediate-Configure=false --no-install-recommends -qq -y "${pkgs[@]}"
-    if [ "${CI_TARGET_ARCH}" == "x86_64" ]; then
-        # install librpma from sources
-        ci/actions-install-librpma.sh
-    fi
+    _sudo apt-get install -o APT::Immediate-Configure=false --no-install-recommends -qq -y "${pkgs[@]}"
 }
 
+# Fedora and related distributions
 install_fedora() {
-    dnf install -y \
-        bison-devel \
-        cmake \
-        cunit-devel \
-        flex-devel \
-        isa-l-devel \
-        kernel-devel \
-        libaio-devel \
-        libgfapi-devel \
-        libibverbs-devel \
-        libiscsi-devel \
-        libnbd-devel \
-        libnfs-devel \
-        libpmem-devel \
-        libpmem2-devel \
-        librbd-devel \
-        numactl-devel \
-        protobuf-c-devel \
-        python3-scipy \
-        python3-sphinx \
-        python3-statsmodels \
-        unzip \
-        valgrind-devel \
-        wget \
+    pkgs=(
+        bison-devel
+        git
+        flex-devel
+	gnutls-devel
+        gperftools
+        isa-l-devel
+        kernel-devel
+        libaio-devel
+        libibverbs-devel
+        libiscsi-devel
+        libnbd-devel
+        libnfs-devel
+        libpmem-devel
+        libpmem2-devel
+        librbd-devel
+        numactl-devel
+        protobuf-c-devel
+        python3-scipy
+        python3-sphinx
+        sudo
+        valgrind-devel
+	${EXTRA_PKGS:-}
+    )
 
-    # install librpma from sources
-    ci/actions-install-librpma.sh
+    case "${CI_TARGET_OS}" in
+        "fedora")
+            pkgs+=(
+                cunit-devel
+                libgfapi-devel
+                python3-statsmodels
+            )
+            ;;
+        "rocky" | "alma" | "oracle")
+            pkgs+=(
+                CUnit-devel
+                python-pip
+            )
+            ;;&
+        "rocky" | "alma")
+            pkgs+=(
+                glusterfs-api-devel
+            )
+            ;;
+    esac
+    dnf install -y "${pkgs[@]}"
+}
+
+install_rhel_clone() {
+    dnf install -y epel-release
+    install_fedora
+
+    # I could not find a python3-statsmodels package in the repos
+    pip3 install statsmodels
+}
+
+install_oracle() {
+    dnf config-manager --set-enabled ol9_codeready_builder
+    install_rhel_clone
+}
+
+install_alma() {
+    dnf install -y 'dnf-command(config-manager)'
+    dnf config-manager --set-enabled crb
+    dnf install -y almalinux-release-devel
+    install_rhel_clone
+}
+
+install_rocky() {
+    dnf install -y 'dnf-command(config-manager)'
+    dnf config-manager --set-enabled crb
+    dnf config-manager --set-enabled devel
+    install_rhel_clone
 }
 
 install_debian() {
@@ -145,7 +191,7 @@ install_macos() {
     #echo "Updating homebrew..."
     #brew update >/dev/null 2>&1
     echo "Installing packages..."
-    HOMEBREW_NO_AUTO_UPDATE=1 brew install cunit libnfs bash
+    HOMEBREW_NO_AUTO_UPDATE=1 brew install cunit libnfs
     pip3 install scipy six statsmodels sphinx
 }
 

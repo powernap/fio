@@ -22,6 +22,8 @@ enum {
 	IO_U_F_BARRIER		= 1 << 6,
 	IO_U_F_VER_LIST		= 1 << 7,
 	IO_U_F_PATTERN_DONE	= 1 << 8,
+	IO_U_F_DEVICE_ERROR	= 1 << 9,
+	IO_U_F_VER_IN_DEV	= 1 << 10, /* Verify data in device */
 };
 
 /*
@@ -109,8 +111,7 @@ struct io_u {
 	 * @success == true means that the I/O operation has been queued or
 	 * completed successfully.
 	 */
-	void (*zbd_queue_io)(struct thread_data *td, struct io_u *, int q,
-			     bool success);
+	void (*zbd_queue_io)(struct thread_data *td, struct io_u *, int *q);
 
 	/*
 	 * ZBD mode zbd_put_io callback: called in after completion of an I/O

@@ -431,7 +431,7 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
 	if (td_randtrimwrite(td) && ddir == DDIR_WRITE) {
 		/* don't mark randommap for these writes */
 		io_u_set(td, io_u, IO_U_F_BUSY_OK);
-		offset = f->last_start[DDIR_TRIM];
+		offset = f->last_start[DDIR_TRIM] - f->file_offset;
 		*is_random = true;
 		ret = 0;
 	} else if (rw_seq) {
@@ -1749,20 +1749,26 @@ static bool check_get_trim(struct thread_data *td, struct io_u *io_u)
 {
 	if (!(td->flags & TD_F_TRIM_BACKLOG))
 		return false;
-	if (!td->trim_entries)
+	if (!td->trim_entries) {
+		td->trim_batch = 0;
 		return false;
+	}
 
 	if (td->trim_batch) {
 		td->trim_batch--;
 		if (get_next_trim(td, io_u))
 			return true;
+		else
+			td->trim_batch = 0;
 	} else if (!(td->io_hist_len % td->o.trim_backlog) &&
-		     td->last_ddir_completed != DDIR_READ) {
-		td->trim_batch = td->o.trim_batch;
-		if (!td->trim_batch)
-			td->trim_batch = td->o.trim_backlog;
-		if (get_next_trim(td, io_u))
+		     td->last_ddir_completed != DDIR_TRIM) {
+		if (get_next_trim(td, io_u)) {
+			td->trim_batch = td->o.trim_batch;
+			if (!td->trim_batch)
+				td->trim_batch = td->o.trim_backlog;
+			td->trim_batch--;
 			return true;
+		}
 	}
 
 	return false;
@@ -1956,7 +1962,8 @@ static void __io_u_log_error(struct thread_data *td, struct io_u *io_u)
 	log_err("fio: io_u error%s%s: %s: %s offset=%llu, buflen=%llu\n",
 		io_u->file ? " on file " : "",
 		io_u->file ? io_u->file->file_name : "",
-		strerror(io_u->error),
+		(io_u->flags & IO_U_F_DEVICE_ERROR) ?
+			"Device-specific error" : strerror(io_u->error),
 		io_ddir_name(io_u->ddir),
 		io_u->offset, io_u->xfer_buflen);
 
@@ -1965,8 +1972,10 @@ static void __io_u_log_error(struct thread_data *td, struct io_u *io_u)
 	if (td->io_ops->errdetails) {
 		char *err = td->io_ops->errdetails(td, io_u);
 
-		log_err("fio: %s\n", err);
-		free(err);
+		if (err) {
+			log_err("fio: %s\n", err);
+			free(err);
+		}
 	}
 
 	if (!td->error)
@@ -2016,8 +2025,7 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 		unsigned long long tnsec;
 
 		tnsec = ntime_since(&io_u->start_time, &icd->time);
-		add_lat_sample(td, idx, tnsec, bytes, io_u->offset,
-			       io_u->ioprio, io_u->clat_prio_index);
+		add_lat_sample(td, idx, tnsec, bytes, io_u);
 
 		if (td->flags & TD_F_PROFILE_OPS) {
 			struct prof_io_ops *ops = &td->prof_io_ops;
@@ -2038,8 +2046,7 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 
 	if (ddir_rw(idx)) {
 		if (!td->o.disable_clat) {
-			add_clat_sample(td, idx, llnsec, bytes, io_u->offset,
-					io_u->ioprio, io_u->clat_prio_index);
+			add_clat_sample(td, idx, llnsec, bytes, io_u);
 			io_u_mark_latency(td, llnsec);
 		}
 
@@ -2073,7 +2080,7 @@ static void file_log_write_comp(const struct thread_data *td, struct fio_file *f
 
 	idx = f->last_write_idx++;
 	f->last_write_comp[idx] = offset;
-	if (f->last_write_idx == td->o.iodepth)
+	if (f->last_write_idx == td->last_write_comp_depth)
 		f->last_write_idx = 0;
 }
 
@@ -2094,6 +2101,11 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 
 	assert(io_u->flags & IO_U_F_FLIGHT);
 	io_u_clear(td, io_u, IO_U_F_FLIGHT | IO_U_F_BUSY_OK | IO_U_F_PATTERN_DONE);
+
+	if (td->o.zone_mode == ZONE_MODE_ZBD && td->o.recover_zbd_write_error &&
+	    io_u->error && io_u->ddir == DDIR_WRITE &&
+	    !td_ioengine_flagged(td, FIO_SYNCIO))
+		zbd_recover_write_error(td, io_u);
 
 	/*
 	 * Mark IO ok to verify
@@ -2301,15 +2313,9 @@ int io_u_queued_complete(struct thread_data *td, int min_evts)
 void io_u_queued(struct thread_data *td, struct io_u *io_u)
 {
 	if (!td->o.disable_slat && ramp_time_over(td) && td->o.stats) {
-		unsigned long slat_time;
-
-		slat_time = ntime_since(&io_u->start_time, &io_u->issue_time);
-
 		if (td->parent)
 			td = td->parent;
-
-		add_slat_sample(td, io_u->ddir, slat_time, io_u->xfer_buflen,
-				io_u->offset, io_u->ioprio);
+		add_slat_sample(td, io_u);
 	}
 }
 

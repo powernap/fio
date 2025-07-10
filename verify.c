@@ -51,6 +51,8 @@ void fill_verify_pattern(struct thread_data *td, void *p, unsigned int len,
 			 struct io_u *io_u, uint64_t seed, int use_seed)
 {
 	struct thread_options *o = &td->o;
+	unsigned int interval = o->verify_pattern_interval;
+	unsigned long long offset = io_u->offset;
 
 	if (!o->verify_pattern_bytes) {
 		dprint(FD_VERIFY, "fill random bytes len=%u\n", len);
@@ -65,18 +67,33 @@ void fill_verify_pattern(struct thread_data *td, void *p, unsigned int len,
 		return;
 	}
 
-	/* Skip if we were here and we do not need to patch pattern
-	 * with format */
-	if (!td->o.verify_fmt_sz && io_u->buf_filled_len >= len) {
+	/* Skip if we were here and we do not need to patch pattern with
+	 * format. However, we cannot skip if verify_offset is set because we
+	 * have swapped the header with pattern bytes */
+	if (!td->o.verify_fmt_sz && io_u->buf_filled_len >= len && !td->o.verify_offset) {
 		dprint(FD_VERIFY, "using already filled verify pattern b=%d len=%u\n",
 			o->verify_pattern_bytes, len);
 		return;
 	}
 
-	(void)paste_format(td->o.verify_pattern, td->o.verify_pattern_bytes,
-			   td->o.verify_fmt, td->o.verify_fmt_sz,
-			   p, len, io_u);
+	if (!interval)
+		interval = len;
+
+	io_u->offset += (p - io_u->buf) - (p - io_u->buf) % interval;
+	for (unsigned int bytes_done = 0, bytes_todo = 0; bytes_done < len;
+			bytes_done += bytes_todo, p += bytes_todo, io_u->offset += interval) {
+		bytes_todo = (p - io_u->buf) % interval;
+		if (!bytes_todo)
+			bytes_todo = interval;
+		bytes_todo = min(bytes_todo, len - bytes_done);
+
+		(void)paste_format(td->o.verify_pattern, td->o.verify_pattern_bytes,
+				   td->o.verify_fmt, td->o.verify_fmt_sz,
+				   p, bytes_todo, io_u);
+	}
+
 	io_u->buf_filled_len = len;
+	io_u->offset = offset;
 }
 
 static unsigned int get_hdr_inc(struct thread_data *td, struct io_u *io_u)
@@ -372,29 +389,15 @@ static inline void *io_u_verify_off(struct verify_header *hdr, struct vcont *vc)
 	return vc->io_u->buf + vc->hdr_num * hdr->len + hdr_size(vc->td, hdr);
 }
 
-static int verify_io_u_pattern(struct verify_header *hdr, struct vcont *vc)
+static int check_pattern(char *buf, unsigned int len, unsigned int mod,
+		unsigned int pattern_size, char *pattern, unsigned int header_size)
 {
-	struct thread_data *td = vc->td;
-	struct io_u *io_u = vc->io_u;
-	char *buf, *pattern;
-	unsigned int header_size = __hdr_size(td->o.verify);
-	unsigned int len, mod, i, pattern_size;
+	unsigned int i;
 	int rc;
-
-	pattern = td->o.verify_pattern;
-	pattern_size = td->o.verify_pattern_bytes;
-	assert(pattern_size != 0);
-
-	(void)paste_format_inplace(pattern, pattern_size,
-				   td->o.verify_fmt, td->o.verify_fmt_sz, io_u);
-
-	buf = (char *) hdr + header_size;
-	len = get_hdr_inc(td, io_u) - header_size;
-	mod = (get_hdr_inc(td, io_u) * vc->hdr_num + header_size) % pattern_size;
 
 	rc = cmp_pattern(pattern, pattern_size, mod, buf, len);
 	if (!rc)
-		return 0;
+		goto done;
 
 	/* Slow path, compare each byte */
 	for (i = 0; i < len; i++) {
@@ -408,18 +411,109 @@ static int verify_io_u_pattern(struct verify_header *hdr, struct vcont *vc)
 				bits);
 			log_err("fio: bad pattern block offset %u\n",
 				i + header_size);
-			vc->name = "pattern";
-			log_verify_failure(hdr, vc);
-			return EILSEQ;
+			rc = EILSEQ;
+			goto done;
 		}
 		mod++;
-		if (mod == td->o.verify_pattern_bytes)
+		if (mod == pattern_size)
 			mod = 0;
 	}
 
-	/* Unreachable line */
-	assert(0);
-	return EILSEQ;
+done:
+	return rc;
+}
+
+/*
+ *  The current thread will need its own buffer if there are multiple threads
+ *  and the pattern contains the offset. Fio currently only has one pattern
+ *  format specifier so we only need to check that one, but this may need to be
+ *  changed if fio ever gains more pattern format specifiers.
+ */
+static inline bool pattern_need_buffer(struct thread_data *td)
+{
+	return td->o.verify_async &&
+		td->o.verify_fmt_sz &&
+		td->o.verify_fmt[0].desc->paste == paste_blockoff;
+}
+
+static int verify_io_u_pattern(struct verify_header *hdr, struct vcont *vc)
+{
+	struct thread_data *td = vc->td;
+	struct io_u *io_u = vc->io_u;
+	char *buf, *pattern;
+	unsigned int header_size = __hdr_size(td->o.verify);
+	unsigned int len, mod, pattern_size, pattern_interval_mod, bytes_done = 0, bytes_todo;
+	int rc;
+	unsigned long long offset = io_u->offset;
+
+	pattern = td->o.verify_pattern;
+	pattern_size = td->o.verify_pattern_bytes;
+	assert(pattern_size != 0);
+
+	/*
+	 * Make this thread safe when verify_async is set and the verify
+	 * pattern includes the offset.
+	 */
+	if (pattern_need_buffer(td)) {
+		pattern = malloc(pattern_size);
+		assert(pattern);
+		memcpy(pattern, td->o.verify_pattern, pattern_size);
+	}
+
+	if (!td->o.verify_pattern_interval) {
+		(void)paste_format_inplace(pattern, pattern_size,
+					   td->o.verify_fmt, td->o.verify_fmt_sz, io_u);
+	}
+
+	/*
+	 * We have 3 cases here:
+	 * 1. Compare the entire buffer if (1) verify_interval is not set and
+	 * (2) verify_pattern_interval is not set
+	 * 2. Compare the entire *verify_interval* if (1) verify_interval *is*
+	 * set and (2) verify_pattern_interval is not set
+	 * 3. Compare *verify_pattern_interval* segments or subsets thereof if
+	 * (2) verify_pattern_interval is set
+	 */
+
+	buf = (char *) hdr + header_size;
+	len = get_hdr_inc(td, io_u) - header_size;
+	if (td->o.verify_pattern_interval) {
+		unsigned int extent = get_hdr_inc(td, io_u) * vc->hdr_num + header_size;
+		pattern_interval_mod = extent % td->o.verify_pattern_interval;
+		mod = pattern_interval_mod % pattern_size;
+		bytes_todo = min(len, td->o.verify_pattern_interval - pattern_interval_mod);
+		io_u->offset += extent / td->o.verify_pattern_interval * td->o.verify_pattern_interval;
+	} else {
+		mod = (get_hdr_inc(td, io_u) * vc->hdr_num + header_size) % pattern_size;
+		bytes_todo = len;
+		pattern_interval_mod = 0;
+	}
+
+	while (bytes_done < len) {
+		if (td->o.verify_pattern_interval) {
+			(void)paste_format_inplace(pattern, pattern_size,
+					td->o.verify_fmt, td->o.verify_fmt_sz,
+					io_u);
+		}
+
+		rc = check_pattern(buf, bytes_todo, mod, pattern_size, pattern, header_size);
+		if (rc) {
+			vc->name = "pattern";
+			log_verify_failure(hdr, vc);
+			break;
+		}
+
+		mod = 0;
+		bytes_done += bytes_todo;
+		buf += bytes_todo;
+		io_u->offset += td->o.verify_pattern_interval;
+		bytes_todo = min(len - bytes_done, td->o.verify_pattern_interval);
+	}
+
+	io_u->offset = offset;
+	if (pattern_need_buffer(td))
+		free(pattern);
+	return rc;
 }
 
 static int verify_io_u_xxhash(struct verify_header *hdr, struct vcont *vc)
@@ -537,6 +631,7 @@ static int verify_io_u_sha512(struct verify_header *hdr, struct vcont *vc)
 
 	fio_sha512_init(&sha512_ctx);
 	fio_sha512_update(&sha512_ctx, p, hdr->len - hdr_size(vc->td, hdr));
+	fio_sha512_final(&sha512_ctx);
 
 	if (!memcmp(vh->sha512, sha512_ctx.buf, sizeof(sha512)))
 		return 0;
@@ -832,7 +927,7 @@ static int verify_header(struct io_u *io_u, struct thread_data *td,
 			hdr->len, hdr_len);
 		goto err;
 	}
-	if (hdr->rand_seed != io_u->rand_seed) {
+	if (td->o.verify_header_seed && (hdr->rand_seed != io_u->rand_seed)) {
 		log_err("verify: bad header rand_seed %"PRIu64
 			", wanted %"PRIu64,
 			hdr->rand_seed, io_u->rand_seed);
@@ -848,12 +943,13 @@ static int verify_header(struct io_u *io_u, struct thread_data *td,
 	/*
 	 * For read-only workloads, the program cannot be certain of the
 	 * last numberio written to a block. Checking of numberio will be
-	 * done only for workloads that write data.  For verify_only,
-	 * numberio check is skipped.
+	 * done only for workloads that write data.  For verify_only or
+	 * any mode de-selecting verify_write_sequence, numberio check is
+	 * skipped.
 	 */
 	if (td_write(td) && (td_min_bs(td) == td_max_bs(td)) &&
 	    !td->o.time_based)
-		if (!td->o.verify_only)
+		if (td->o.verify_write_sequence)
 			if (hdr->numberio != io_u->numberio) {
 				log_err("verify: bad header numberio %"PRIu16
 					", wanted %"PRIu16,
@@ -900,6 +996,13 @@ int verify_io_u(struct thread_data *td, struct io_u **io_u_ptr)
 	if (td_ioengine_flagged(td, FIO_FAKEIO))
 		return 0;
 
+	/*
+	 * If data has already been verified from the device, we can skip
+	 * the actual verification phase here.
+	 */
+	if (io_u->flags & IO_U_F_VER_IN_DEV)
+		return 0;
+
 	if (io_u->flags & IO_U_F_TRIMMED) {
 		ret = verify_trimmed_io_u(td, io_u);
 		goto done;
@@ -924,14 +1027,6 @@ int verify_io_u(struct thread_data *td, struct io_u **io_u_ptr)
 		if (td->o.verify_offset)
 			memswp(p, p + td->o.verify_offset, header_size);
 		hdr = p;
-
-		/*
-		 * Make rand_seed check pass when have verify_backlog or
-		 * zone reset frequency for zonemode=zbd.
-		 */
-		if (!td_rw(td) || (td->flags & TD_F_VER_BACKLOG) ||
-		    td->o.zrf.u.f)
-			io_u->rand_seed = hdr->rand_seed;
 
 		if (td->o.verify != VERIFY_PATTERN_NO_HDR) {
 			ret = verify_header(io_u, td, hdr, hdr_num, hdr_inc);
@@ -1003,7 +1098,7 @@ int verify_io_u(struct thread_data *td, struct io_u **io_u_ptr)
 			ret = EINVAL;
 		}
 
-		if (ret && verify_type != hdr->verify_type)
+		if (ret && verify_type != hdr->verify_type && verify_type != VERIFY_PATTERN_NO_HDR)
 			log_err("fio: verify type mismatch (%u media, %u given)\n",
 					hdr->verify_type, verify_type);
 	}
@@ -1084,6 +1179,7 @@ static void fill_sha512(struct verify_header *hdr, void *p, unsigned int len)
 
 	fio_sha512_init(&sha512_ctx);
 	fio_sha512_update(&sha512_ctx, p, len);
+	fio_sha512_final(&sha512_ctx);
 }
 
 static void fill_sha256(struct verify_header *hdr, void *p, unsigned int len)
@@ -1543,15 +1639,15 @@ static int __fill_file_completions(struct thread_data *td,
 	if (!f->last_write_comp)
 		return 0;
 
-	if (td->io_blocks[DDIR_WRITE] < td->o.iodepth)
+	if (td->io_blocks[DDIR_WRITE] < td->last_write_comp_depth)
 		comps = td->io_blocks[DDIR_WRITE];
 	else
-		comps = td->o.iodepth;
+		comps = td->last_write_comp_depth;
 
 	j = f->last_write_idx - 1;
 	for (i = 0; i < comps; i++) {
 		if (j == -1)
-			j = td->o.iodepth - 1;
+			j = td->last_write_comp_depth - 1;
 		s->comps[*index].fileno = __cpu_to_le64(f->fileno);
 		s->comps[*index].offset = cpu_to_le64(f->last_write_comp[j]);
 		(*index)++;
@@ -1594,7 +1690,7 @@ struct all_io_list *get_all_io_list(int save_mask, size_t *sz)
 			continue;
 		td->stop_io = 1;
 		td->flags |= TD_F_VSTATE_SAVED;
-		depth += (td->o.iodepth * td->o.nr_files);
+		depth += (td->last_write_comp_depth * td->o.nr_files);
 		nr++;
 	} end_for_each();
 
@@ -1620,6 +1716,7 @@ struct all_io_list *get_all_io_list(int save_mask, size_t *sz)
 
 		s->no_comps = cpu_to_le64((uint64_t) comps);
 		s->depth = cpu_to_le32((uint32_t) td->o.iodepth);
+		s->max_no_comps_per_file = cpu_to_le32((uint32_t) td->last_write_comp_depth);
 		s->nofiles = cpu_to_le32((uint32_t) td->o.nr_files);
 		s->numberio = cpu_to_le64((uint64_t) td->io_issues[DDIR_WRITE]);
 		s->index = cpu_to_le64((uint64_t) __td_index);
@@ -1751,6 +1848,7 @@ void verify_assign_state(struct thread_data *td, void *p)
 
 	s->no_comps = le64_to_cpu(s->no_comps);
 	s->depth = le32_to_cpu(s->depth);
+	s->max_no_comps_per_file = le32_to_cpu(s->max_no_comps_per_file);
 	s->nofiles = le32_to_cpu(s->nofiles);
 	s->numberio = le64_to_cpu(s->numberio);
 	s->rand.use64 = le64_to_cpu(s->rand.use64);
@@ -1884,5 +1982,7 @@ int verify_state_should_stop(struct thread_data *td, struct io_u *io_u)
 	/*
 	 * Not found, we have to stop
 	 */
+	log_info("Stop verify because offset %llu in %s is not recorded in verify state\n",
+		 io_u->verify_offset, f->file_name);
 	return 1;
 }

@@ -978,8 +978,11 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 	if (td_write(td) && td_random(td) && td->o.norandommap)
 		total_bytes = max(total_bytes, (uint64_t) td->o.io_size);
 
-	/* Don't break too early if io_size > size */
-	if (td_rw(td) && !td_random(td))
+	/*
+	 * Don't break too early if io_size > size. The exception is when
+	 * verify is enabled.
+	 */
+	if (td_rw(td) && !td_random(td) && td->o.verify == VERIFY_NONE)
 		total_bytes = max(total_bytes, (uint64_t)td->o.io_size);
 
 	/*
@@ -1068,6 +1071,17 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 		 */
 		if (td->o.verify != VERIFY_NONE && io_u->ddir == DDIR_READ &&
 		    ((io_u->flags & IO_U_F_VER_LIST) || !td_rw(td))) {
+
+			/*
+			 * For read only workloads generate the seed. This way
+			 * we can still verify header seed at any later
+			 * invocation.
+			 */
+			if (!td_write(td) && !td->o.verify_pattern_bytes) {
+				io_u->rand_seed = __rand(&td->verify_state);
+				if (sizeof(int) != sizeof(long *))
+					io_u->rand_seed *= __rand(&td->verify_state);
+			}
 
 			if (verify_state_should_stop(td, io_u)) {
 				put_io_u(td, io_u);
@@ -1234,8 +1248,18 @@ static int init_file_completion_logging(struct thread_data *td,
 	if (td->o.verify == VERIFY_NONE || !td->o.verify_state_save)
 		return 0;
 
+	/*
+	 * Async IO completion order may be different from issue order. Double
+	 * the number of write completions to cover the case the writes issued
+	 * earlier complete slowly and fall in the last write log entries.
+	 */
+	td->last_write_comp_depth = depth;
+	if (!td_ioengine_flagged(td, FIO_SYNCIO))
+		td->last_write_comp_depth += depth;
+
 	for_each_file(td, f, i) {
-		f->last_write_comp = scalloc(depth, sizeof(uint64_t));
+		f->last_write_comp = scalloc(td->last_write_comp_depth,
+					     sizeof(uint64_t));
 		if (!f->last_write_comp)
 			goto cleanup;
 	}
@@ -1258,6 +1282,10 @@ static void cleanup_io_u(struct thread_data *td)
 			td->io_ops->io_u_free(td, io_u);
 
 		fio_memfree(io_u, sizeof(*io_u), td_offload_overlap(td));
+	}
+
+	while ((io_u = io_u_rpop(&td->io_u_requeues)) != NULL) {
+		put_io_u(td, io_u);
 	}
 
 	free_io_mem(td);
@@ -1970,7 +1998,8 @@ static void *thread_main(void *data)
 			update_runtime(td, elapsed_us, DDIR_READ);
 		if (td_write(td) && td->io_bytes[DDIR_WRITE])
 			update_runtime(td, elapsed_us, DDIR_WRITE);
-		if (td_trim(td) && td->io_bytes[DDIR_TRIM])
+		if (td->io_bytes[DDIR_TRIM] && (td_trim(td) ||
+			((td->flags & TD_F_TRIM_BACKLOG) && td_write(td))))
 			update_runtime(td, elapsed_us, DDIR_TRIM);
 		fio_gettime(&td->start, NULL);
 		fio_sem_up(stat_sem);

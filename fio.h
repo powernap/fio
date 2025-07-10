@@ -292,6 +292,7 @@ struct thread_data {
 
 	unsigned int verify_batch;
 	unsigned int trim_batch;
+	bool trim_verify;
 
 	struct thread_io_list *vstate;
 
@@ -387,6 +388,7 @@ struct thread_data {
 	struct fio_sem *sem;
 	uint64_t bytes_done[DDIR_RWDIR_CNT];
 	uint64_t bytes_verified;
+	uint32_t last_write_comp_depth;
 
 	uint64_t *thinktime_blocks_counter;
 	struct timespec last_thinktime;
@@ -617,7 +619,14 @@ extern bool eta_time_within_slack(unsigned int time);
 static inline void fio_ro_check(const struct thread_data *td, struct io_u *io_u)
 {
 	assert(!(io_u->ddir == DDIR_WRITE && !td_write(td)) &&
-	       !(io_u->ddir == DDIR_TRIM && !td_trim(td)));
+	       !(io_u->ddir == DDIR_TRIM && !(td_trim(td) || td->trim_verify)));
+
+	/*
+	 * The last line above allows trim operations during trim/verify
+	 * workloads. For these workloads we cannot simply set the trim bit for
+	 * the thread's ddir because then fio would assume that
+	 * ddir={trimewrite, randtrimwrite}.
+	 */
 }
 
 static inline bool multi_range_trim(struct thread_data *td, struct io_u *io_u)
@@ -798,6 +807,15 @@ extern void lat_target_reset(struct thread_data *);
 		for ((i) = 0, (f) = (td)->files[0];			\
 	    	 (i) < (td)->o.nr_files && ((f) = (td)->files[i]) != NULL; \
 		 (i)++)
+
+static inline bool fio_offset_overlap_risk(struct thread_data *td)
+{
+	if (td->o.norandommap || td->o.softrandommap ||
+	    td->o.ddir_seq_add || (td->o.ddir_seq_nr > 1))
+		return true;
+
+	return false;
+}
 
 static inline bool fio_fill_issue_time(struct thread_data *td)
 {

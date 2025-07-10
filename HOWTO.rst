@@ -808,7 +808,10 @@ Target file/device
 	For HTTP and S3 access, specify a valid URL path or S3 key, respectively.
 	A filename for path-style S3 includes a bucket name (:file:`/bucket/k/e.y`)
 	while a virtual-hosted-style S3 filename :file:`/k/e.y` does not because 
-	its bucket name is specified in :option:`http_host`.
+	its bucket name is specified in :option:`http_host`. In both cases, the
+	filename should begin with a ``/``. The HTTP engine does not automatically
+	add a leading ``/`` when constructing URLs from :option:`http_host` and
+	:option:`filename`.
 
 	The filename "`-`" is a reserved name, meaning *stdin* or *stdout*.  Which
 	of the two depends on the read/write direction set.
@@ -1126,6 +1129,17 @@ Target file/device
 	requests. This and the previous parameter can be used to simulate
 	garbage collection activity.
 
+.. option:: recover_zbd_write_error=bool
+
+	If this option is specified together with the option
+	:option:`continue_on_error`, check the write pointer positions after the
+	failed writes to sequential write required zones. Then move the write
+	pointers so that the next writes do not fail due to partial writes and
+	unexpected write pointer positions. If :option:`continue_on_error` is
+	not specified, errors out. When the writes are asynchronous, the write
+	pointer move fills blocks with zero then breaks verify data. If an
+	asynchronous IO engine and :option:`verify` workload are specified,
+	errors out. Default: false.
 
 I/O type
 ~~~~~~~~
@@ -1185,7 +1199,9 @@ I/O type
 	pattern, then the *<nr>* value specified will be **added** to the generated
 	offset for each I/O turning sequential I/O into sequential I/O with holes.
 	For instance, using ``rw=write:4k`` will skip 4k for every write.  Also see
-	the :option:`rw_sequencer` option.
+	the :option:`rw_sequencer` option. If this is used with :option:`verify`
+	then :option:`verify_header_seed` will be disabled, unless its explicitly
+	enabled.
 
 .. option:: rw_sequencer=str
 
@@ -1564,11 +1580,12 @@ I/O type
 	this option is given, fio will just get a new random offset without looking
 	at past I/O history. This means that some blocks may not be read or written,
 	and that some blocks may be read/written more than once. If this option is
-	used with :option:`verify` and multiple blocksizes (via :option:`bsrange`),
-	only intact blocks are verified, i.e., partially-overwritten blocks are
-	ignored.  With an async I/O engine and an I/O depth > 1, it is possible for
-	the same block to be overwritten, which can cause verification errors.  Either
-	do not use norandommap in this case, or also use the lfsr random generator.
+	used with :option:`verify` then :option:`verify_header_seed` will be
+	disabled. If this option is used with :option:`verify` and multiple blocksizes
+	(via :option:`bsrange`), only intact blocks are verified, i.e.,
+	partially-overwritten blocks are ignored. With an async I/O engine and an I/O
+	depth > 1, header write sequence number verification will be disabled. See
+	:option:`verify_write_sequence`.
 
 .. option:: softrandommap=bool
 
@@ -2501,6 +2518,24 @@ with the caveat that when used on the command line, they must come after the
 	For direct I/O, requests will only succeed if cache invalidation isn't required,
 	file blocks are fully allocated and the disk request could be issued immediately.
 
+.. option:: atomic=bool : [pvsync2] [libaio] [io_uring]
+
+	This option means that writes are issued with torn-write protection, meaning
+	that for a power fail or kernel crash, all or none of the data from the write
+	will be stored, but never a mix of old and new data. Torn-write protection is
+	also known as atomic writes.
+
+	This option sets the RWF_ATOMIC flag (supported from the 6.11 Linux kernel) on
+	a per-IO basis.
+
+	Writes with RWF_ATOMIC set will be rejected by the kernel when the file does
+	not support torn-write protection. To learn a file's torn-write limits, issue
+	statx with STATX_WRITE_ATOMIC.
+
+.. option:: libaio_vectored=bool : [libaio]
+
+    Submit vectored read and write requests.
+
 .. option:: fdp=bool : [io_uring_cmd] [xnvme]
 
 	Enable Flexible Data Placement mode for write commands.
@@ -2577,7 +2612,9 @@ with the caveat that when used on the command line, they must come after the
 
 .. option:: md_per_io_size=int : [io_uring_cmd] [xnvme]
 
-	Size in bytes for separate metadata buffer per IO. Default: 0.
+        Size in bytes for separate metadata buffer per IO. For io_uring_cmd
+        these buffers are allocated using malloc regardless of what is set for
+        :option:`iomem`. Default: 0.
 
 .. option:: pi_act=int : [io_uring_cmd] [xnvme]
 
@@ -2667,7 +2704,7 @@ with the caveat that when used on the command line, they must come after the
 		this will be the starting port number since fio will use a range of
 		ports.
 
-   [rdma], [librpma_*]
+   [rdma]
 
 		The port to use for RDMA-CM communication. This should be the same value
 		on the client and the server side.
@@ -2677,20 +2714,6 @@ with the caveat that when used on the command line, they must come after the
 	The hostname or IP address to use for TCP, UDP or RDMA-CM based I/O.  If the job
 	is a TCP listener or UDP reader, the hostname is not used and must be omitted
 	unless it is a valid UDP multicast address.
-
-.. option:: serverip=str : [librpma_*]
-
-	The IP address to be used for RDMA-CM based I/O.
-
-.. option:: direct_write_to_pmem=bool : [librpma_*]
-
-	Set to 1 only when Direct Write to PMem from the remote host is possible.
-	Otherwise, set to 0.
-
-.. option:: busy_wait_polling=bool : [librpma_*_server]
-
-	Set to 0 to wait for completion instead of busy-wait polling completion.
-	Default: 1.
 
 .. option:: interface=str : [netsplice] [net]
 
@@ -2883,6 +2906,17 @@ with the caveat that when used on the command line, they must come after the
                 **verify**
                         Use Verify commands for write operations
 
+.. option:: verify_mode=str : [io_uring_cmd]
+
+        Specifies the type of command to be used in the verification phase.  Defaults to 'read'.
+
+                **read**
+                        Use Read commands for data verification
+                **compare**
+                        Use Compare commands for data verification.  This option is only valid with
+                        specific pattern(s), which means it *must* be given with `verify=pattern` and
+                        `verify_pattern=<pattern>`.
+
 .. option:: sg_write_mode=str : [sg]
 
 	Specify the type of write commands to issue. This option can take ten values:
@@ -2978,6 +3012,10 @@ with the caveat that when used on the command line, they must come after the
 .. option:: http_s3_keyid=str : [http]
 
 	The S3 key/access id.
+
+.. option:: http_s3_security_token=str : [http]
+
+	The S3 security token.
 
 .. option:: http_s3_sse_customer_key=str : [http]
 
@@ -3801,7 +3839,9 @@ Verification
 	invocation of this workload. This option allows one to check data multiple
 	times at a later date without overwriting it. This option makes sense only
 	for workloads that write data, and does not support workloads with the
-	:option:`time_based` option set.
+	:option:`time_based` option set. :option:`verify_write_sequence` and
+	:option:`verify_header_seed` will be disabled in this mode, unless they are
+	explicitly enabled.
 
 .. option:: do_verify=bool
 
@@ -3814,8 +3854,9 @@ Verification
 	of the job. Each verification method also implies verification of special
 	header, which is written to the beginning of each block. This header also
 	includes meta information, like offset of the block, block number, timestamp
-	when block was written, etc.  :option:`verify` can be combined with
-	:option:`verify_pattern` option.  The allowed values are:
+	when block was written, initial seed value used to generate the buffer
+	contents etc. :option:`verify` can be combined with :option:`verify_pattern`
+	option.  The allowed values are:
 
 		**md5**
 			Use an md5 sum of the data area and store it in the header of
@@ -3884,15 +3925,26 @@ Verification
 			basic information and checksumming, but if this option is set, only
 			the specific pattern set with :option:`verify_pattern` is verified.
 
+		**pattern_hdr**
+			Verify a pattern in conjunction with a header.
+
 		**null**
 			Only pretend to verify. Useful for testing internals with
 			:option:`ioengine`\=null, not for much else.
 
 	This option can be used for repeated burn-in tests of a system to make sure
-	that the written data is also correctly read back. If the data direction
-	given is a read or random read, fio will assume that it should verify a
-	previously written file. If the data direction includes any form of write,
-	the verify will be of the newly written data.
+	that the written data is also correctly read back.
+
+	If the data direction given is a read or random read, fio will assume that
+	it should verify a previously written file. In this scenario fio will not
+	verify the block number written in the header. The header seed won't be
+	verified, unless its explicitly requested by setting
+	:option:`verify_header_seed`. Note in this scenario the header seed check
+	will only work if the read invocation exactly matches the original write
+	invocation.
+
+	If the data direction includes any form of write, the verify will be of the
+	newly written data.
 
 	To avoid false verification errors, do not use the norandommap option when
 	verifying data with async I/O engines and I/O depths > 1.  Or use the
@@ -3902,7 +3954,8 @@ Verification
 .. option:: verify_offset=int
 
 	Swap the verification header with data somewhere else in the block before
-	writing. It is swapped back before verifying.
+	writing. It is swapped back before verifying. This should be within the
+	range of :option:`verify_interval`.
 
 .. option:: verify_interval=int
 
@@ -3927,6 +3980,14 @@ Verification
 	Or use combination of everything::
 
 		verify_pattern=0xff%o"abcd"-12
+
+.. option:: verify_pattern_interval=bool
+
+        Recreate an instance of the :option:`verify_pattern` every
+        :option:`verify_pattern_interval` bytes. This is only useful when
+        :option:`verify_pattern` contains the %o format specifier and can be
+        used to speed up the process of writing each block on a device with its
+        offset. Default: 0 (disabled).
 
 .. option:: verify_fatal=bool
 
@@ -4001,6 +4062,26 @@ Verification
         for later use during the verification phase. Experimental verify
         instead resets the file after the write phase and then replays I/Os for
         the verification phase.
+
+.. option:: verify_write_sequence=bool
+
+        Verify the header write sequence number. In a scenario with multiple jobs,
+        verification of the write sequence number may fail. Disabling this option
+        will mean that write sequence number checking is skipped. Doing that can be
+        useful for testing atomic writes, as it means that checksum verification can
+        still be attempted. For when :option:`atomic` is enabled, checksum
+        verification is expected to succeed (while write sequence checking can still
+        fail).
+        Defaults to true.
+
+.. option:: verify_header_seed=bool
+
+	Verify the header seed value which was used to generate the buffer contents.
+	In certain scenarios with read / verify only workloads, when
+	:option:`norandommap` is enabled, with offset modifiers
+	(refer :option:`readwrite` and :option:`rw_sequencer`) etc verification of
+	header seed may fail. Disabling this option will mean that header seed
+	checking is skipped. Defaults to true.
 
 .. option:: trim_percentage=int
 
@@ -4107,6 +4188,11 @@ Measurements and reporting
 	`kb_base`, `unit_base`, `sig_figs`, `thread_number`, `pid`, and
 	`job_start`. For these properties, the values for the first job are
 	recorded for the group.
+
+        Also, options like :option:`percentile_list` and
+        :option:`unified_rw_reporting` should be consistent among the jobs in a
+        reporting group. Having options like these vary across the jobs in a
+        reporting group is an unsupported configuration.
 
 .. option:: new_group
 
@@ -4236,6 +4322,21 @@ Measurements and reporting
 	If this is set, the iolog options will include the byte offset for the I/O
 	entry as well as the other data values. Defaults to 0 meaning that
 	offsets are not present in logs. Also see `Log File Formats`_.
+
+.. option:: log_prio=bool
+
+	If this is set, the *Command priority* field in `Log File Formats`_
+	shows the priority value and the IO priority class of the command.
+	Otherwise, the field shows if the command has the highest RT
+	priority class or not. Also see	`Log File Formats`_.
+
+.. option:: log_issue_time=bool
+
+	If this is set, the iolog options will include the command issue time
+	for the I/O entry as well as the other data values. Defaults to 0
+	meaning that command issue times are not present in logs. Also see
+	`Log File Formats`_. This option shall be set together with
+	:option:`write_lat_log` and :option:`log_offset`.
 
 .. option:: log_compression=int
 
@@ -5202,7 +5303,7 @@ Fio supports a variety of log file formats, for logging latencies, bandwidth,
 and IOPS. The logs share a common format, which looks like this:
 
     *time* (`msec`), *value*, *data direction*, *block size* (`bytes`),
-    *offset* (`bytes`), *command priority*
+    *offset* (`bytes`), *command priority*, *issue time* (`nsec`)
 
 *Time* for the log entry is always in milliseconds. The *value* logged depends
 on the type of log, it will be one of the following:
@@ -5227,8 +5328,21 @@ The entry's *block size* is always in bytes. The *offset* is the position in byt
 from the start of the file for that particular I/O. The logging of the offset can be
 toggled with :option:`log_offset`.
 
-*Command priority* is 0 for normal priority and 1 for high priority. This is controlled
-by the ioengine specific :option:`cmdprio_percentage`.
+If :option:`log_prio` is not set, the entry's *Command priority* is 1 for an IO
+executed with the highest RT priority class (:option:`prioclass` =1 or
+:option:`cmdprio_class` =1) and 0 otherwise. This is controlled by the
+:option:`prioclass` option and the ioengine specific
+:option:`cmdprio_percentage`  :option:`cmdprio_class` options. If
+:option:`log_prio` is set, the entry's *Command priority* is the priority set
+for the IO, as a 16-bits hexadecimal number with the lowest 13 bits indicating
+the priority value (:option:`prio` and :option:`cmdprio` options) and the
+highest 3 bits indicating the IO priority class (:option:`prioclass` and
+:option:`cmdprio_class` options).
+
+The entry's *issue time* is the command issue time in nanoseconds. The logging
+of the issue time can be toggled with :option:`log_issue_time`. This field has
+valid values in completion latency log file (clat), or submit latency log file
+(slat). The field has value 0 in other logs files.
 
 Fio defaults to logging every individual I/O but when windowed logging is set
 through :option:`log_avg_msec`, either the average (by default), the maximum
@@ -5238,12 +5352,12 @@ is set to both) is recorded. The log file format when both the values are report
 takes this form:
 
     *time* (`msec`), *value*, *value1*, *data direction*, *block size* (`bytes`),
-    *offset* (`bytes`), *command priority*
+    *offset* (`bytes`), *command priority*, *issue time* (`nsec`)
 
 
 Each *data direction* seen within the window period will aggregate its values in a
-separate row. Further, when using windowed logging the *block size* and *offset*
-entries will always contain 0.
+separate row. Further, when using windowed logging the *block size*, *offset*
+and *issue time* entries will always contain 0.
 
 
 Client/Server
@@ -5337,5 +5451,14 @@ containing two hostnames ``h1`` and ``h2`` with IP addresses 192.168.10.120 and
 	/mnt/nfs/fio/192.168.10.120.fileio.tmp
 	/mnt/nfs/fio/192.168.10.121.fileio.tmp
 
+This behavior can be disabled by the :option:`unique_filename` option.
+
 Terse output in client/server mode will differ slightly from what is produced
 when fio is run in stand-alone mode. See the terse output section for details.
+
+Also, if one fio invocation runs workloads on multiple servers, fio will
+provide at the end an aggregate summary report for all workloads. This
+aggregate summary report assumes that options affecting reporting like
+:option:`unified_rw_reporting` and :option:`percentile_list` are identical
+across all the jobs summarized. Having different values for these options is an
+unsupported configuration.

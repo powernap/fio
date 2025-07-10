@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "35 5 * * *"  # 5:35 UTC which is 0:35 ET
 
 jobs:
   build-containers:
@@ -14,6 +17,9 @@ jobs:
         container:
         - {os: 'debian', dh: 'debian', ver: 'bookworm', target_arch: 'x86_64'}
         - {os: 'fedora', dh: 'fedora', ver: '40', target_arch: 'x86_64'}
+        - {os: 'alma', dh: 'almalinux', ver: '9', target_arch: 'x86_64'}
+        - {os: 'oracle', dh: 'oraclelinux', ver: '9', target_arch: 'x86_64'}
+        - {os: 'rocky', dh: 'rockylinux', ver: '9', target_arch: 'x86_64'}
         - {os: 'ubuntu', dh: 'ubuntu', ver: 'noble', target_arch: 'i686'}
         - {os: 'ubuntu', dh: 'ubuntu', ver: 'noble', target_arch: 'x86_64'}
 
@@ -127,6 +133,9 @@ jobs:
           mingw-w64-${{matrix.arch}}-python-statsmodels
           mingw-w64-${{matrix.arch}}-python-sphinx
 
+    - name: install bash 4 (macOS)
+      if: ${{ contains( matrix.build, 'macOS' ) }}
+      run:  HOMEBREW_NO_AUTO_UPDATE=1 brew install bash
     - name: Install dependencies
       run: ${{matrix.shell}} ./ci/actions-install.sh
       if: ${{ !contains( matrix.build, 'msys2' ) }}

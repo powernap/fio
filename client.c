@@ -61,7 +61,8 @@ int sum_stat_clients;
 static int sum_stat_nr;
 static struct buf_output allclients;
 static struct json_object *root = NULL;
-static struct json_object *job_opt_object = NULL;
+static struct json_object *global_opt_object = NULL;
+static struct json_array *global_opt_array = NULL;
 static struct json_array *clients_array = NULL;
 static struct json_array *du_array = NULL;
 
@@ -189,8 +190,13 @@ static void fio_client_json_init(void)
 	json_object_add_value_int(root, "timestamp", time_p);
 	json_object_add_value_string(root, "time", time_buf);
 
-	job_opt_object = json_create_object();
-	json_object_add_value_object(root, "global options", job_opt_object);
+	if (nr_clients == 1) {
+		global_opt_object = json_create_object();
+		json_object_add_value_object(root, "global options", global_opt_object);
+	} else {
+		global_opt_array = json_create_array();
+		json_object_add_value_array(root, "global options", global_opt_array);
+	}
 	clients_array = json_create_array();
 	json_object_add_value_array(root, "client_stats", clients_array);
 	du_array = json_create_array();
@@ -215,7 +221,8 @@ static void fio_client_json_fini(void)
 
 	json_free_object(root);
 	root = NULL;
-	job_opt_object = NULL;
+	global_opt_object = NULL;
+	global_opt_array = NULL;
 	clients_array = NULL;
 	du_array = NULL;
 }
@@ -1116,11 +1123,13 @@ static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd)
 		opt_list = &client->opt_lists[p->ts.thread_number - 1];
 
 	tsobj = show_thread_status(&p->ts, &p->rs, opt_list, &client->buf);
-	client->did_stat = true;
 	if (tsobj) {
 		json_object_add_client_info(tsobj, client);
 		json_array_add_value_object(clients_array, tsobj);
+		if (!client->did_stat && client->global_opts)
+			json_array_add_value_object(global_opt_array, client->global_opts);
 	}
+	client->did_stat = true;
 
 	if (sum_stat_clients <= 1)
 		return;
@@ -1128,6 +1137,16 @@ static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd)
 	sum_thread_stats(&client_ts, &p->ts);
 	sum_group_stats(&client_gs, &p->rs);
 
+	if (!client_ts.members) {
+		/* Arbitrarily use the percentile toggles and percentile list
+		 * from the first thread_stat that comes our way */
+		client_ts.slat_percentiles = p->ts.slat_percentiles;
+		client_ts.clat_percentiles = p->ts.clat_percentiles;
+		client_ts.lat_percentiles = p->ts.lat_percentiles;
+
+		for (int i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
+			client_ts.percentile_list[i] = p->ts.percentile_list[i];
+	}
 	client_ts.members++;
 	client_ts.thread_number = p->ts.thread_number;
 	client_ts.groupid = p->ts.groupid;
@@ -1161,12 +1180,31 @@ static void handle_job_opt(struct fio_client *client, struct fio_net_cmd *cmd)
 	pdu->groupid = le32_to_cpu(pdu->groupid);
 
 	if (pdu->global) {
-		if (!job_opt_object)
+		struct json_object *global_opts;
+
+		if (!global_opt_object && !global_opt_array)
 			return;
 
-		json_object_add_value_string(job_opt_object,
+		/*
+		 * If we have only one server connection, add it to the single
+		 * global option dictionary. When we have connections to
+		 * multiple servers, add the global option to the
+		 * server-specific dictionary.
+		 */
+		if (global_opt_object) {
+			global_opts = global_opt_object;
+		} else {
+			if (!client->global_opts) {
+				client->global_opts = json_create_object();
+				json_object_add_client_info(client->global_opts, client);
+			}
+			global_opts = client->global_opts;
+		}
+
+		json_object_add_value_string(global_opts,
 					     (const char *)pdu->name,
 					     (const char *)pdu->value);
+		return;
 	} else if (client->opt_lists) {
 		struct flist_head *opt_list = &client->opt_lists[pdu->groupid];
 		struct print_option *p;
@@ -1388,8 +1426,8 @@ static void handle_eta(struct fio_client *client, struct fio_net_cmd *cmd)
 static void client_flush_hist_samples(FILE *f, int hist_coarseness, void *samples,
 				      uint64_t sample_size)
 {
-	struct io_sample *s;
-	int log_offset;
+	struct io_sample *s, *s_tmp;
+	bool log_offset, log_issue_time;
 	uint64_t i, j, nr_samples;
 	struct io_u_plat_entry *entry;
 	uint64_t *io_u_plat;
@@ -1399,15 +1437,17 @@ static void client_flush_hist_samples(FILE *f, int hist_coarseness, void *sample
 	if (!sample_size)
 		return;
 
-	s = __get_sample(samples, 0, 0);
+	s = __get_sample(samples, 0, 0, 0);
 	log_offset = (s->__ddir & LOG_OFFSET_SAMPLE_BIT) != 0;
+	log_issue_time = (s->__ddir & LOG_ISSUE_TIME_SAMPLE_BIT) != 0;
 
-	nr_samples = sample_size / __log_entry_sz(log_offset);
+	nr_samples = sample_size / __log_entry_sz(log_offset, log_issue_time);
 
 	for (i = 0; i < nr_samples; i++) {
 
-		s = (struct io_sample *)((char *)__get_sample(samples, log_offset, i) +
-			i * sizeof(struct io_u_plat_entry));
+		s_tmp = __get_sample(samples, log_offset, log_issue_time, i);
+		s = (struct io_sample *)((char *)s_tmp +
+					 i * sizeof(struct io_u_plat_entry));
 
 		entry = s->data.plat_entry;
 		io_u_plat = entry->io_u_plat;
@@ -1595,6 +1635,7 @@ static struct cmd_iolog_pdu *convert_iolog_gz(struct fio_net_cmd *cmd,
 	uint64_t nr_samples;
 	size_t total;
 	char *p;
+	size_t log_entry_size;
 
 	stream.zalloc = Z_NULL;
 	stream.zfree = Z_NULL;
@@ -1610,11 +1651,13 @@ static struct cmd_iolog_pdu *convert_iolog_gz(struct fio_net_cmd *cmd,
 	 */
 	nr_samples = le64_to_cpu(pdu->nr_samples);
 
+	log_entry_size = __log_entry_sz(le32_to_cpu(pdu->log_offset),
+					le32_to_cpu(pdu->log_issue_time));
 	if (pdu->log_type == IO_LOG_TYPE_HIST)
-		total = nr_samples * (__log_entry_sz(le32_to_cpu(pdu->log_offset)) +
-					sizeof(struct io_u_plat_entry));
+		total = nr_samples * (log_entry_size +
+				      sizeof(struct io_u_plat_entry));
 	else
-		total = nr_samples * __log_entry_sz(le32_to_cpu(pdu->log_offset));
+		total = nr_samples * log_entry_size;
 	ret = malloc(total + sizeof(*pdu));
 	ret->nr_samples = nr_samples;
 
@@ -1703,6 +1746,7 @@ static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *cmd,
 	ret->compressed		= le32_to_cpu(ret->compressed);
 	ret->log_offset		= le32_to_cpu(ret->log_offset);
 	ret->log_prio		= le32_to_cpu(ret->log_prio);
+	ret->log_issue_time	= le32_to_cpu(ret->log_issue_time);
 	ret->log_hist_coarseness = le32_to_cpu(ret->log_hist_coarseness);
 	ret->per_job_logs	= le32_to_cpu(ret->per_job_logs);
 
@@ -1713,7 +1757,7 @@ static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *cmd,
 	for (i = 0; i < ret->nr_samples; i++) {
 		struct io_sample *s;
 
-		s = __get_sample(samples, ret->log_offset, i);
+		s = __get_sample(samples, ret->log_offset, ret->log_issue_time, i);
 		if (ret->log_type == IO_LOG_TYPE_HIST)
 			s = (struct io_sample *)((char *)s + sizeof(struct io_u_plat_entry) * i);
 
@@ -1726,11 +1770,13 @@ static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *cmd,
 		s->bs		= le64_to_cpu(s->bs);
 		s->priority	= le16_to_cpu(s->priority);
 
-		if (ret->log_offset) {
-			struct io_sample_offset *so = (void *) s;
+		if (ret->log_offset)
+			s->aux[IOS_AUX_OFFSET_INDEX] =
+				le64_to_cpu(s->aux[IOS_AUX_OFFSET_INDEX]);
 
-			so->offset = le64_to_cpu(so->offset);
-		}
+		if (ret->log_issue_time)
+			s->aux[IOS_AUX_ISSUE_TIME_INDEX] =
+				le64_to_cpu(s->aux[IOS_AUX_ISSUE_TIME_INDEX]);
 
 		if (ret->log_type == IO_LOG_TYPE_HIST) {
 			s->data.plat_entry = (struct io_u_plat_entry *)(((char *)s) + sizeof(*s));

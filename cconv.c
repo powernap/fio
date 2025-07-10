@@ -182,8 +182,11 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->verify_state = le32_to_cpu(top->verify_state);
 	o->verify_interval = le32_to_cpu(top->verify_interval);
 	o->verify_offset = le32_to_cpu(top->verify_offset);
+	o->verify_write_sequence = le32_to_cpu(top->verify_write_sequence);
+	o->verify_header_seed = le32_to_cpu(top->verify_header_seed);
 
 	o->verify_pattern_bytes = le32_to_cpu(top->verify_pattern_bytes);
+	o->verify_pattern_interval = le32_to_cpu(top->verify_pattern_interval);
 	o->buffer_pattern_bytes = le32_to_cpu(top->buffer_pattern_bytes);
 	if (o->verify_pattern_bytes >= MAX_PATTERN_SIZE ||
 	    o->buffer_pattern_bytes >= MAX_PATTERN_SIZE ||
@@ -216,6 +219,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->log_max = le32_to_cpu(top->log_max);
 	o->log_offset = le32_to_cpu(top->log_offset);
 	o->log_prio = le32_to_cpu(top->log_prio);
+	o->log_issue_time = le32_to_cpu(top->log_issue_time);
 	o->log_gz = le32_to_cpu(top->log_gz);
 	o->log_gz_store = le32_to_cpu(top->log_gz_store);
 	o->log_alternate_epoch = le32_to_cpu(top->log_alternate_epoch);
@@ -262,6 +266,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->zone_mode = le32_to_cpu(top->zone_mode);
 	o->max_open_zones = __le32_to_cpu(top->max_open_zones);
 	o->ignore_zone_limits = le32_to_cpu(top->ignore_zone_limits);
+	o->recover_zbd_write_error = le32_to_cpu(top->recover_zbd_write_error);
 	o->lockmem = le64_to_cpu(top->lockmem);
 	o->offset_increment_percent = le32_to_cpu(top->offset_increment_percent);
 	o->offset_increment = le64_to_cpu(top->offset_increment);
@@ -441,7 +446,10 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->verify_state = cpu_to_le32(o->verify_state);
 	top->verify_interval = cpu_to_le32(o->verify_interval);
 	top->verify_offset = cpu_to_le32(o->verify_offset);
+	top->verify_write_sequence = cpu_to_le32(o->verify_write_sequence);
+	top->verify_header_seed = cpu_to_le32(o->verify_header_seed);
 	top->verify_pattern_bytes = cpu_to_le32(o->verify_pattern_bytes);
+	top->verify_pattern_interval = cpu_to_le32(o->verify_pattern_interval);
 	top->verify_fatal = cpu_to_le32(o->verify_fatal);
 	top->verify_dump = cpu_to_le32(o->verify_dump);
 	top->verify_async = cpu_to_le32(o->verify_async);
@@ -458,6 +466,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->log_max = cpu_to_le32(o->log_max);
 	top->log_offset = cpu_to_le32(o->log_offset);
 	top->log_prio = cpu_to_le32(o->log_prio);
+	top->log_issue_time = cpu_to_le32(o->log_issue_time);
 	top->log_gz = cpu_to_le32(o->log_gz);
 	top->log_gz_store = cpu_to_le32(o->log_gz_store);
 	top->log_alternate_epoch = cpu_to_le32(o->log_alternate_epoch);
@@ -631,6 +640,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->zone_mode = __cpu_to_le32(o->zone_mode);
 	top->max_open_zones = __cpu_to_le32(o->max_open_zones);
 	top->ignore_zone_limits = cpu_to_le32(o->ignore_zone_limits);
+	top->recover_zbd_write_error = cpu_to_le32(o->recover_zbd_write_error);
 	top->lockmem = __cpu_to_le64(o->lockmem);
 	top->ddir_seq_add = __cpu_to_le64(o->ddir_seq_add);
 	top->file_size_low = __cpu_to_le64(o->file_size_low);
